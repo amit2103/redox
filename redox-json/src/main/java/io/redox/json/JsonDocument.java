@@ -79,37 +79,31 @@ public final class JsonDocument extends io.redox.core.Document {
             byte b = src[i];
 
             // ── Whitespace ────────────────────────────────────────────
-            if (b == ' ' || b == '\t' || b == '\n' || b == '\r') { i++; continue; }
+            if (b == ' ' || b == '\t' || b == '\n' || b == '\r') {
+                i = VectorScanner.skipWhitespace(src, i, end);
+                continue;
+            }
 
             // ── String ───────────────────────────────────────────────
             if (b == '"') {
-                i++; // skip opening quote
+                i++;
                 int strStart = i;
                 int variant  = DTokenVariant.STRING;
 
-                // SWAR fast scanner: 8 bytes at a time for '"' and '\\'
-                STRING_SCAN:
+                // Vector/SWAR scanner: finds first '"' or '\\' in bulk
+                SCAN:
                 while (i < end) {
-                    if (UnsafeAccess.SWAR_ENABLED) {
-                        while (i + 8 <= end) {
-                            long w   = UnsafeAccess.UNSAFE.getLong(src, UnsafeAccess.BYTE_ARRAY_BASE + i);
-                            int  hit = UnsafeAccess.firstByte(
-                                    UnsafeAccess.swarMatch(w, 0x22L),
-                                    UnsafeAccess.swarMatch(w, 0x5CL));
-                            if (hit < 8) { i += hit; break; }
-                            i += 8;
-                        }
-                    }
-                    while (i < end) {
-                        byte c = src[i];
-                        if (c == '"') break STRING_SCAN;
-                        if (c == '\\') { variant = DTokenVariant.STRING_DOUBLE_QUOTE; i += 2; break; }
-                        i++;
-                    }
+                    i = VectorScanner.nextSpecial(src, i, end);
+                    if (i >= end) break;
+                    byte c = src[i];
+                    if (c == '"') break SCAN;
+                    // c == '\\': mark as escaped, skip two bytes, restart
+                    variant = DTokenVariant.STRING_DOUBLE_QUOTE;
+                    i += 2;
                 }
 
                 int strLen = i - strStart;
-                i++; // skip closing quote
+                i++;
 
                 long payload = DToken.encodeLengthOffset(strLen, strStart);
                 int tokenId  = allocToken(DToken.make(variant, payload));

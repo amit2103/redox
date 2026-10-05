@@ -65,29 +65,35 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
             w.println();
             w.println("    public static final " + converterName + " INSTANCE = new " + converterName + "();");
             w.println();
-            w.println("    // Unsafe singleton — null if unavailable (fallback to direct assignment)");
-            w.println("    private static final sun.misc.Unsafe _U = io.redox.json.UnsafeAccess.UNSAFE;");
-            w.println();
-            // ── Pre-encoded key byte arrays ──
+            // ── Pre-encoded key byte arrays (class-load time, one alloc per key) ──
             for (FieldInfo fi : fields) {
                 w.println("    private static final byte[] " + keyConst(fi)
                         + " = io.redox.json.RawKey.encode(\"" + fi.jsonName + "\");");
             }
-            // ── Unsafe field offsets for primitive fields ──
-            boolean hasPrimitive = fields.stream().anyMatch(fi -> isPrimitiveKind(fi.type));
-            if (hasPrimitive) {
-                w.println();
-                for (FieldInfo fi : fields) {
-                    if (isPrimitiveKind(fi.type)) {
-                        w.println("    private static final long " + offConst(fi)
-                                + " = (_U != null) ? io.redox.json.UnsafeAccess.fieldOffset("
-                                + targetRef + ".class, \"" + fi.javaName + "\") : -1L;");
-                    }
+            w.println();
+            // ── VarHandle per field (Panama: safe for ALL types, has GC write barrier) ──
+            for (FieldInfo fi : fields) {
+                if (!isList(fi.type)) { // lists handled via direct assignment after coercion
+                    w.println("    private static final java.lang.invoke.VarHandle " + vhConst(fi) + ";");
                 }
             }
             w.println();
             w.println("    static {");
-            w.println("        io.redox.json.DoxConverterRegistry.register(" + targetRef + ".class, INSTANCE);");
+            // Initialise VarHandles with privateLookupIn so private fields are accessible too
+            w.println("        java.lang.invoke.MethodHandles.Lookup _lk;");
+            w.println("        try {");
+            w.println("            _lk = java.lang.invoke.MethodHandles.privateLookupIn("
+                    + targetRef + ".class, java.lang.invoke.MethodHandles.lookup());");
+            for (FieldInfo fi : fields) {
+                if (!isList(fi.type)) {
+                    String typeLit = varHandleTypeLiteral(fi.type);
+                    w.println("            " + vhConst(fi) + " = _lk.findVarHandle("
+                            + targetRef + ".class, \"" + fi.javaName + "\", " + typeLit + ");");
+                }
+            }
+            w.println("            io.redox.json.DoxConverterRegistry.register("
+                    + targetRef + ".class, INSTANCE);");
+            w.println("        } catch (Exception _e) { throw new ExceptionInInitializerError(_e); }");
             w.println("    }");
             w.println();
 
@@ -179,24 +185,25 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
     private void writeStreamFieldBody(PrintWriter w, FieldInfo fi) {
         w.println("                _p.nextToken(); // advance to value");
         if (isList(fi.type)) {
+            // Lists: plain assignment (VarHandle gains nothing here over direct assignment)
             w.println("                if (_p.currentToken() == io.redox.json.JsonStreamParser.Token.VALUE_NULL) {");
             w.println("                    obj." + fi.javaName + " = null;");
             w.println("                } else {");
             w.println("                    obj." + fi.javaName + " = _sl_" + fi.javaName + "(_p);");
             w.println("                }");
-        } else if (isPrimitiveKind(fi.type) && !isBoxedType(fi.type)) {
-            // Unsafe raw write for primitive fields — eliminates null-check and type-check overhead.
-            // Guard on _U != null (falls back to direct assignment on JVMs without Unsafe).
-            String off = offConst(fi);
-            String put = unsafePutCall(fi.type, "obj", off, streamValueExpr(fi.type));
-            w.println("                if (_U != null && " + off + " >= 0L) { " + put + " }");
-            w.println("                else { obj." + fi.javaName + " = " + streamValueExpr(fi.type) + "; }");
         } else {
-            w.println("                obj." + fi.javaName + " = " + streamValueExpr(fi.type) + ";");
+            // VarHandle.set(): JIT-inlineable, null-/type-check eliminated after warmup.
+            // Safe for both primitives AND references (has GC write barrier — unlike Unsafe).
+            w.println("                " + vhConst(fi) + ".set(obj, " + streamValueExpr(fi.type) + ");");
         }
     }
 
-    /** Returns the Unsafe field offset constant name for a field. */
+    /** VarHandle field name in the generated class. */
+    private String vhConst(FieldInfo fi) {
+        return "_VH_" + fi.javaName.replaceAll("[^a-zA-Z0-9]", "_");
+    }
+
+    /** Old Unsafe offset constant — kept for deserialization fallback in tape path. */
     private String offConst(FieldInfo fi) {
         return "_OFF_" + fi.javaName.replaceAll("[^a-zA-Z0-9]", "_");
     }
@@ -221,17 +228,25 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
                 "java.lang.Short".equals(qn));
     }
 
-    /** Returns the Unsafe.putXxx call for a primitive field write. */
-    private String unsafePutCall(TypeMirror type, String obj, String offset, String value) {
-        switch (type.getKind()) {
-            case INT:     return "_U.putInt("     + obj + ", " + offset + ", " + value + ");";
-            case LONG:    return "_U.putLong("    + obj + ", " + offset + ", " + value + ");";
-            case DOUBLE:  return "_U.putDouble("  + obj + ", " + offset + ", " + value + ");";
-            case FLOAT:   return "_U.putFloat("   + obj + ", " + offset + ", " + value + ");";
-            case BOOLEAN: return "_U.putBoolean(" + obj + ", " + offset + ", " + value + ");";
-            case BYTE:    return "_U.putByte("    + obj + ", " + offset + ", " + value + ");";
-            case SHORT:   return "_U.putShort("   + obj + ", " + offset + ", " + value + ");";
-            default:      return obj + ".field = " + value + ";";
+    /**
+     * Returns the {@code .class} literal needed for {@code findVarHandle}.
+     * For primitives: {@code int.class}.  For references: {@code String.class}, etc.
+     */
+    private String varHandleTypeLiteral(TypeMirror tm) {
+        switch (tm.getKind()) {
+            case INT:     return "int.class";
+            case LONG:    return "long.class";
+            case DOUBLE:  return "double.class";
+            case FLOAT:   return "float.class";
+            case BOOLEAN: return "boolean.class";
+            case BYTE:    return "byte.class";
+            case SHORT:   return "short.class";
+            case DECLARED: {
+                // For reference types use the erased class (no generics in VarHandle)
+                TypeElement te = (TypeElement) ((DeclaredType) tm).asElement();
+                return te.getQualifiedName() + ".class";
+            }
+            default: return "Object.class";
         }
     }
 
@@ -367,8 +382,9 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
             writeListDeserialize(w, (DeclaredType) fi.type, "_v", "obj." + fi.javaName,
                     "                ", 0);
         } else {
-            w.println("                obj." + fi.javaName
-                    + " = " + deserializeExprSimple(fi.type, "_v") + ";");
+            // VarHandle.set() — same JIT path as bindFromParser
+            w.println("                " + vhConst(fi) + ".set(obj, "
+                    + deserializeExprSimple(fi.type, "_v") + ");");
         }
     }
 
