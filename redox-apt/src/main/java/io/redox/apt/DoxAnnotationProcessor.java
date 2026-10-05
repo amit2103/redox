@@ -65,10 +65,25 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
             w.println();
             w.println("    public static final " + converterName + " INSTANCE = new " + converterName + "();");
             w.println();
-            // ── Pre-encoded key byte arrays (one allocation at class-load time) ──
+            w.println("    // Unsafe singleton — null if unavailable (fallback to direct assignment)");
+            w.println("    private static final sun.misc.Unsafe _U = io.redox.json.UnsafeAccess.UNSAFE;");
+            w.println();
+            // ── Pre-encoded key byte arrays ──
             for (FieldInfo fi : fields) {
                 w.println("    private static final byte[] " + keyConst(fi)
                         + " = io.redox.json.RawKey.encode(\"" + fi.jsonName + "\");");
+            }
+            // ── Unsafe field offsets for primitive fields ──
+            boolean hasPrimitive = fields.stream().anyMatch(fi -> isPrimitiveKind(fi.type));
+            if (hasPrimitive) {
+                w.println();
+                for (FieldInfo fi : fields) {
+                    if (isPrimitiveKind(fi.type)) {
+                        w.println("    private static final long " + offConst(fi)
+                                + " = (_U != null) ? io.redox.json.UnsafeAccess.fieldOffset("
+                                + targetRef + ".class, \"" + fi.javaName + "\") : -1L;");
+                    }
+                }
             }
             w.println();
             w.println("    static {");
@@ -164,14 +179,59 @@ public class DoxAnnotationProcessor extends AbstractProcessor {
     private void writeStreamFieldBody(PrintWriter w, FieldInfo fi) {
         w.println("                _p.nextToken(); // advance to value");
         if (isList(fi.type)) {
-            // null-check + call stream list helper
             w.println("                if (_p.currentToken() == io.redox.json.JsonStreamParser.Token.VALUE_NULL) {");
             w.println("                    obj." + fi.javaName + " = null;");
             w.println("                } else {");
             w.println("                    obj." + fi.javaName + " = _sl_" + fi.javaName + "(_p);");
             w.println("                }");
+        } else if (isPrimitiveKind(fi.type) && !isBoxedType(fi.type)) {
+            // Unsafe raw write for primitive fields — eliminates null-check and type-check overhead.
+            // Guard on _U != null (falls back to direct assignment on JVMs without Unsafe).
+            String off = offConst(fi);
+            String put = unsafePutCall(fi.type, "obj", off, streamValueExpr(fi.type));
+            w.println("                if (_U != null && " + off + " >= 0L) { " + put + " }");
+            w.println("                else { obj." + fi.javaName + " = " + streamValueExpr(fi.type) + "; }");
         } else {
             w.println("                obj." + fi.javaName + " = " + streamValueExpr(fi.type) + ";");
+        }
+    }
+
+    /** Returns the Unsafe field offset constant name for a field. */
+    private String offConst(FieldInfo fi) {
+        return "_OFF_" + fi.javaName.replaceAll("[^a-zA-Z0-9]", "_");
+    }
+
+    /** True if the type is a Java primitive (int, long, double, float, boolean, byte, short). */
+    private boolean isPrimitiveKind(TypeMirror tm) {
+        switch (tm.getKind()) {
+            case INT: case LONG: case DOUBLE: case FLOAT:
+            case BOOLEAN: case BYTE: case SHORT: return true;
+            default: return false;
+        }
+    }
+
+    /** True for boxed types like Integer, Long, etc. */
+    private boolean isBoxedType(TypeMirror tm) {
+        if (tm.getKind() != TypeKind.DECLARED) return false;
+        String qn = ((TypeElement)((DeclaredType)tm).asElement()).getQualifiedName().toString();
+        return qn.startsWith("java.lang.") && (
+                "java.lang.Integer".equals(qn) || "java.lang.Long".equals(qn) ||
+                "java.lang.Double".equals(qn)  || "java.lang.Float".equals(qn) ||
+                "java.lang.Boolean".equals(qn) || "java.lang.Byte".equals(qn) ||
+                "java.lang.Short".equals(qn));
+    }
+
+    /** Returns the Unsafe.putXxx call for a primitive field write. */
+    private String unsafePutCall(TypeMirror type, String obj, String offset, String value) {
+        switch (type.getKind()) {
+            case INT:     return "_U.putInt("     + obj + ", " + offset + ", " + value + ");";
+            case LONG:    return "_U.putLong("    + obj + ", " + offset + ", " + value + ");";
+            case DOUBLE:  return "_U.putDouble("  + obj + ", " + offset + ", " + value + ");";
+            case FLOAT:   return "_U.putFloat("   + obj + ", " + offset + ", " + value + ");";
+            case BOOLEAN: return "_U.putBoolean(" + obj + ", " + offset + ", " + value + ");";
+            case BYTE:    return "_U.putByte("    + obj + ", " + offset + ", " + value + ");";
+            case SHORT:   return "_U.putShort("   + obj + ", " + offset + ", " + value + ");";
+            default:      return obj + ".field = " + value + ";";
         }
     }
 

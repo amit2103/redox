@@ -79,7 +79,6 @@ public final class JsonStreamParser {
 
     /** Advance to the next token and return its type. */
     public Token nextToken() {
-        // skip whitespace
         while (pos < end) {
             byte b = src[pos];
             if (b != ' ' && b != '\t' && b != '\n' && b != '\r') break;
@@ -229,12 +228,36 @@ public final class JsonStreamParser {
         strOffset = pos;
         strHasEscapes = false;
 
+        // ── SWAR string scanner ─────────────────────────────────────────────
+        // Process 8 bytes per iteration. '"'=0x22, '\\'=0x5C.
+        // On a hit, fall through to the scalar loop from the hit position.
+        // On no hit in 8 bytes, advance 8. After a '\\', restart SWAR so segments
+        // between escapes also benefit from the fast path.
+        OUTER:
         while (pos < end) {
-            byte c = src[pos];
-            if (c == '"') break;
-            if (c == '\\') { strHasEscapes = true; pos++; } // skip escaped char
-            pos++;
+            if (UnsafeAccess.SWAR_ENABLED) {
+                while (pos + 8 <= end) {
+                    long w    = UnsafeAccess.UNSAFE.getLong(src, UnsafeAccess.BYTE_ARRAY_BASE + pos);
+                    long mq   = UnsafeAccess.swarMatch(w, 0x22L); // '"'
+                    long mb   = UnsafeAccess.swarMatch(w, 0x5CL); // '\\'
+                    int  hit  = UnsafeAccess.firstByte(mq, mb);
+                    if (hit < 8) { pos += hit; break; } // found: handle below
+                    pos += 8; // clean 8 bytes, skip
+                }
+            }
+            // scalar finish: exact detection and escape handling
+            while (pos < end) {
+                byte c = src[pos];
+                if (c == '"') break OUTER;
+                if (c == '\\') {
+                    strHasEscapes = true;
+                    pos += 2; // skip both '\' and the escaped char
+                    break;    // restart SWAR from new position
+                }
+                pos++;
+            }
         }
+
         strLen = pos - strOffset;
         pos++; // skip closing '"'
 

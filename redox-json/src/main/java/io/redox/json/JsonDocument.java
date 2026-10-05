@@ -85,15 +85,29 @@ public final class JsonDocument extends io.redox.core.Document {
             if (b == '"') {
                 i++; // skip opening quote
                 int strStart = i;
-                int variant  = DTokenVariant.STRING; // assume no escapes
+                int variant  = DTokenVariant.STRING;
 
-                // scan for closing quote or backslash
+                // SWAR fast scanner: 8 bytes at a time for '"' and '\\'
+                STRING_SCAN:
                 while (i < end) {
-                    byte c = src[i];
-                    if (c == '"') break;
-                    if (c == '\\') { variant = DTokenVariant.STRING_DOUBLE_QUOTE; i++; } // skip escaped char
-                    i++;
+                    if (UnsafeAccess.SWAR_ENABLED) {
+                        while (i + 8 <= end) {
+                            long w   = UnsafeAccess.UNSAFE.getLong(src, UnsafeAccess.BYTE_ARRAY_BASE + i);
+                            int  hit = UnsafeAccess.firstByte(
+                                    UnsafeAccess.swarMatch(w, 0x22L),
+                                    UnsafeAccess.swarMatch(w, 0x5CL));
+                            if (hit < 8) { i += hit; break; }
+                            i += 8;
+                        }
+                    }
+                    while (i < end) {
+                        byte c = src[i];
+                        if (c == '"') break STRING_SCAN;
+                        if (c == '\\') { variant = DTokenVariant.STRING_DOUBLE_QUOTE; i += 2; break; }
+                        i++;
+                    }
                 }
+
                 int strLen = i - strStart;
                 i++; // skip closing quote
 
